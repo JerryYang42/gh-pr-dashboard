@@ -321,10 +321,10 @@ def fetch_repo(spec: RepoSpec, me: str, since: str,
             aliases.append(alias)
             parts.append(
                 f"{alias}: search(query: {json.dumps(q)}, type: ISSUE, first: 50) "
-                f"{{ pageInfo {{ hasNextPage }} nodes {{ ... on PullRequest {{ ...PR }} }} }}"
+                "{ pageInfo { hasNextPage } nodes { ... on PullRequest { id number updatedAt } } }"
             )
-    query = "query {\nrateLimit { cost remaining resetAt }\n" + "\n".join(parts) + "\n}\n" + PR_FRAGMENT
-    data, warns = gh_graphql(spec.host, query, context=spec.key, usage=usage)
+    query = "query {\nrateLimit { cost remaining resetAt }\n" + "\n".join(parts) + "\n}"
+    data, warns = gh_graphql(spec.host, query, context=f"{spec.key} discovery", usage=usage)
     found: dict[str, dict] = {}
     roles: dict[str, set[str]] = {}
     for alias in aliases:
@@ -656,6 +656,30 @@ def sync_all(cfg: Config, progress: Callable[[str], None] = lambda m: None) -> S
                 res.warnings += warns
 
                 existing = {r["id"]: r for r in con.execute("SELECT * FROM pr WHERE repo_key=?", (spec.key,))}
+                hydrate_ids = []
+                raw_by_id = {}
+                for pid, discovered in found.items():
+                    old_row = existing.get(pid)
+                    if old_row is None:
+                        hydrate_ids.append(pid)
+                        continue
+                    old_raw = json.loads(old_row["raw"])
+                    if (discovered.get("updatedAt")
+                            and discovered.get("updatedAt") == old_raw.get("updatedAt")
+                            and discovered["_roles"] == old_raw.get("_roles", [])):
+                        raw_by_id[pid] = old_raw
+                    else:
+                        hydrate_ids.append(pid)
+                hydrated = fetch_nodes(
+                    spec.host, hydrate_ids, context=f"{spec.key} PR hydration", usage=res.graphql_usage,
+                ) if hydrate_ids else {}
+                missing = [pid for pid in hydrate_ids if pid not in hydrated]
+                if missing:
+                    raise GhError(f"{spec.key}: GraphQL returned no PR data for {len(missing)} discovered PR(s)")
+                for pid in hydrate_ids:
+                    hydrated[pid]["_roles"] = found[pid]["_roles"]
+                raw_by_id.update(hydrated)
+                found = raw_by_id
                 lost = [i_ for i_, r in existing.items() if i_ not in found and not r["hidden"] and r["state"] == "OPEN"]
                 refetched = fetch_nodes(
                     spec.host, lost, context=f"{spec.key} lost PR refetch", usage=res.graphql_usage,

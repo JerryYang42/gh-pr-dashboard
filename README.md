@@ -142,7 +142,7 @@ Other environment variables: `PRDASH_GH` points to a different `gh` binary.
 
 ## How syncing works
 
-For each repo, one GraphQL request (through `gh api graphql --hostname <host>`) runs a set of searches scoped to that repo only: PRs you authored, are assigned to, have a review requested on, have reviewed, or are otherwise involved in, open plus recently closed. Results are merged by PR, stored, and diffed. Open PRs that stopped matching any search are re-fetched by id so that merges and closures are still recorded; if one is still open but no longer involves you, it is hidden.
+For each repo, a lightweight GraphQL discovery request (through `gh api graphql --hostname <host>`) runs searches scoped to that repo: PRs you authored, are assigned to, have a review requested on, have reviewed, or are otherwise involved in, open plus recently closed. Results are merged by PR ID. Full PR details are fetched in batches only for new PRs or PRs whose `updatedAt` or matched roles changed; cached details are reused for unchanged PRs. This preserves current role membership while avoiding repeated detail reads. Open PRs that stopped matching any search are re-fetched by id so that merges and closures are still recorded; if one is still open but no longer involves you, it is hidden.
 
 `prdash sync` reports GraphQL request count, cost, remaining quota, reset time
 and duration per request, grouped by host. The values come from GitHub's

@@ -20,14 +20,17 @@ detection, recently closed PR handling, and offline-first dashboard behavior.
 
 ### 2. Reduce repeated and unnecessary detail fetching
 
-- Separate discovery from hydration: search for relevant PRs with the fields
-  needed to identify and deduplicate them, then fetch full PR details once per
-  unique PR ID.
-- Evaluate an incremental path that avoids full hydration when a PR's
-  `updatedAt` has not changed. Retain the existing full-data path where needed
-  to detect state transitions and preserve event history.
-- Compare query costs and sync duration against the baseline. Keep the change
-  only if it reduces measured API work without losing observable behavior.
+- [x] Separate discovery from hydration: search for relevant PRs using only
+  their ID, number and `updatedAt`, merge overlapping results, then fetch full
+  PR details in batches for unique IDs.
+- [x] Reuse cached details when `updatedAt` and matched roles are unchanged.
+  Hydrate when either changes; still fully refetch open PRs that stop matching
+  searches so merges, closures and lost involvement are detected.
+- [ ] Compare query costs and sync duration against the Stage 1 baseline. Keep
+  the optimization only if measured API work falls without behavioral
+  regressions.
+
+Implementation is complete; the live before/after comparison remains pending.
 
 ### 3. Add bounded concurrency if measurements justify it
 
