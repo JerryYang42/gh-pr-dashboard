@@ -37,7 +37,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TextIO
 
 GH = os.environ.get("PRDASH_GH", "gh")
 
@@ -220,18 +220,37 @@ class GhError(Exception):
     pass
 
 
-def gh_graphql(host: str, query: str, variables: dict | None = None) -> tuple[dict, list[str]]:
+@dataclass
+class GraphQLUsage:
+    host: str
+    context: str
+    cost: int | None = None
+    remaining: int | None = None
+    reset_at: str | None = None
+    duration_seconds: float = 0
+
+
+def gh_graphql(host: str, query: str, variables: dict | None = None, *,
+               context: str = "GraphQL request",
+               usage: list[GraphQLUsage] | None = None) -> tuple[dict, list[str]]:
+    request_usage = GraphQLUsage(host, context)
+    if usage is not None:
+        usage.append(request_usage)
     body = json.dumps({"query": query, "variables": variables or {}})
     env = {**os.environ, "GH_PROMPT_DISABLED": "1", "NO_COLOR": "1"}
+    started = time.monotonic()
     try:
-        p = subprocess.run(
-            [GH, "api", "graphql", "--hostname", host, "--method", "POST", "--input", "-"],
-            input=body, capture_output=True, text=True, timeout=180, env=env,
-        )
-    except FileNotFoundError:
-        raise GhError("`gh` CLI not found on PATH (https://cli.github.com)") from None
-    except subprocess.TimeoutExpired:
-        raise GhError(f"timed out talking to {host}") from None
+        try:
+            p = subprocess.run(
+                [GH, "api", "graphql", "--hostname", host, "--method", "POST", "--input", "-"],
+                input=body, capture_output=True, text=True, timeout=180, env=env,
+            )
+        except FileNotFoundError:
+            raise GhError("`gh` CLI not found on PATH (https://cli.github.com)") from None
+        except subprocess.TimeoutExpired:
+            raise GhError(f"timed out talking to {host}") from None
+    finally:
+        request_usage.duration_seconds = time.monotonic() - started
     out = None
     if p.stdout.strip():
         try:
@@ -241,12 +260,19 @@ def gh_graphql(host: str, query: str, variables: dict | None = None) -> tuple[di
     if not out or out.get("data") is None:
         msg = (p.stderr or p.stdout).strip() or f"gh exited with {p.returncode}"
         raise GhError(msg[:400])
+    limit = out["data"].get("rateLimit") or {}
+    request_usage.cost = limit.get("cost")
+    request_usage.remaining = limit.get("remaining")
+    request_usage.reset_at = limit.get("resetAt")
     return out["data"], [e.get("message", "") for e in out.get("errors") or []]
 
 
-def get_me(host: str) -> str:
+def get_me(host: str, usage: list[GraphQLUsage] | None = None) -> str:
     try:
-        data, _ = gh_graphql(host, "query { viewer { login } }")
+        data, _ = gh_graphql(
+            host, "query { viewer { login } rateLimit { cost remaining resetAt } }",
+            context="viewer lookup", usage=usage,
+        )
     except GhError as e:
         raise GhError(f"{e}  (try: gh auth login --hostname {host})") from None
     return data["viewer"]["login"]
@@ -283,7 +309,8 @@ ROLE_QUERIES = [
 ]
 
 
-def fetch_repo(spec: RepoSpec, me: str, since: str) -> tuple[dict[str, dict], list[str]]:
+def fetch_repo(spec: RepoSpec, me: str, since: str,
+               usage: list[GraphQLUsage] | None = None) -> tuple[dict[str, dict], list[str]]:
     aliases, parts = [], []
     for role, qual, with_closed in ROLE_QUERIES:
         for st, extra in (("open", "is:open"), ("closed", f"is:closed closed:>={since}")):
@@ -296,8 +323,8 @@ def fetch_repo(spec: RepoSpec, me: str, since: str) -> tuple[dict[str, dict], li
                 f"{alias}: search(query: {json.dumps(q)}, type: ISSUE, first: 50) "
                 f"{{ pageInfo {{ hasNextPage }} nodes {{ ... on PullRequest {{ ...PR }} }} }}"
             )
-    query = "query {\n" + "\n".join(parts) + "\n}\n" + PR_FRAGMENT
-    data, warns = gh_graphql(spec.host, query)
+    query = "query {\nrateLimit { cost remaining resetAt }\n" + "\n".join(parts) + "\n}\n" + PR_FRAGMENT
+    data, warns = gh_graphql(spec.host, query, context=spec.key, usage=usage)
     found: dict[str, dict] = {}
     roles: dict[str, set[str]] = {}
     for alias in aliases:
@@ -314,12 +341,16 @@ def fetch_repo(spec: RepoSpec, me: str, since: str) -> tuple[dict[str, dict], li
     return found, warns
 
 
-def fetch_nodes(host: str, ids: list[str]) -> dict[str, dict]:
+def fetch_nodes(host: str, ids: list[str], *,
+                context: str = "lost PR refetch",
+                usage: list[GraphQLUsage] | None = None) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for i in range(0, len(ids), 40):
         chunk = ids[i:i + 40]
-        data, _ = gh_graphql(host, "query($ids: [ID!]!) { nodes(ids: $ids) { ... on PullRequest { ...PR } } }" + PR_FRAGMENT,
-                             {"ids": chunk})
+        query = ("query($ids: [ID!]!) { rateLimit { cost remaining resetAt } "
+                 "nodes(ids: $ids) { ... on PullRequest { ...PR } } }" + PR_FRAGMENT)
+        data, _ = gh_graphql(host, query, {"ids": chunk},
+                             context=f"{context} ({len(chunk)} PRs)", usage=usage)
         for n in data.get("nodes") or []:
             if n and "id" in n:
                 out[n["id"]] = n
@@ -578,6 +609,8 @@ class SyncResult:
     events: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    graphql_usage: list[GraphQLUsage] = field(default_factory=list)
+    duration_seconds: float = 0
 
 
 def _upsert(con: sqlite3.Connection, spec: RepoSpec, me: str, raw: dict, old_row: sqlite3.Row | None,
@@ -608,6 +641,7 @@ def _upsert(con: sqlite3.Connection, spec: RepoSpec, me: str, raw: dict, old_row
 
 def sync_all(cfg: Config, progress: Callable[[str], None] = lambda m: None) -> SyncResult:
     res = SyncResult()
+    started = time.monotonic()
     con = connect(cfg.db)
     since = (date.today() - timedelta(days=cfg.closed_days)).isoformat()
     mes: dict[str, str] = {}
@@ -616,14 +650,16 @@ def sync_all(cfg: Config, progress: Callable[[str], None] = lambda m: None) -> S
             progress(f"Syncing {spec.key} ({i}/{len(cfg.repos)})...")
             try:
                 if spec.host not in mes:
-                    mes[spec.host] = get_me(spec.host)
+                    mes[spec.host] = get_me(spec.host, res.graphql_usage)
                 me = mes[spec.host]
-                found, warns = fetch_repo(spec, me, since)
+                found, warns = fetch_repo(spec, me, since, res.graphql_usage)
                 res.warnings += warns
 
                 existing = {r["id"]: r for r in con.execute("SELECT * FROM pr WHERE repo_key=?", (spec.key,))}
                 lost = [i_ for i_, r in existing.items() if i_ not in found and not r["hidden"] and r["state"] == "OPEN"]
-                refetched = fetch_nodes(spec.host, lost) if lost else {}
+                refetched = fetch_nodes(
+                    spec.host, lost, context=f"{spec.key} lost PR refetch", usage=res.graphql_usage,
+                ) if lost else {}
             except GhError as e:
                 res.failures.append((spec.key, str(e)))
                 continue
@@ -656,7 +692,39 @@ def sync_all(cfg: Config, progress: Callable[[str], None] = lambda m: None) -> S
             con.execute("DELETE FROM pr WHERE state!='OPEN' AND synced<?", (cutoff,))
     finally:
         con.close()
+        res.duration_seconds = time.monotonic() - started
     return res
+
+
+def print_sync_telemetry(usage: list[GraphQLUsage], duration_seconds: float,
+                         stream: TextIO = sys.stderr) -> None:
+    by_host: dict[str, list[GraphQLUsage]] = {}
+    for request in usage:
+        by_host.setdefault(request.host, []).append(request)
+    for host, requests in by_host.items():
+        reported = [request for request in requests if request.cost is not None]
+        cost = sum(request.cost or 0 for request in reported)
+        remaining = next((request.remaining for request in reversed(requests)
+                          if request.remaining is not None), None)
+        reset_at = next((request.reset_at for request in reversed(requests)
+                         if request.reset_at), None)
+        quota = f"{cost} points ({len(reported)}/{len(requests)} reported)"
+        if not reported:
+            quota = f"n/a (0/{len(requests)} reported)"
+        suffix = f"; remaining {remaining}" if remaining is not None else "; remaining n/a"
+        if reset_at:
+            suffix += f"; resets {reset_at}"
+        print(f"GraphQL {host}: {len(requests)} requests; cost {quota}{suffix}", file=stream)
+        for request in requests:
+            cost_text = str(request.cost) if request.cost is not None else "n/a"
+            remaining_text = str(request.remaining) if request.remaining is not None else "n/a"
+            reset_text = f"; reset {request.reset_at}" if request.reset_at else ""
+            print(
+                f"  {request.context}: cost {cost_text}; remaining {remaining_text}"
+                f"{reset_text}; {request.duration_seconds:.2f}s",
+                file=stream,
+            )
+    print(f"Sync duration: {duration_seconds:.2f}s", file=stream)
 
 
 # --------------------------------------------------------------------------- views
@@ -1158,6 +1226,7 @@ def main(argv: list[str] | None = None) -> int:
         for e in cfg.errors:
             print(f"! {e}", file=sys.stderr)
         res = sync_all(cfg, lambda m: print(m, file=sys.stderr))
+        print_sync_telemetry(res.graphql_usage, res.duration_seconds)
         for repo, err in res.failures:
             print(f"! {repo}: {err}", file=sys.stderr)
         for w in res.warnings:
