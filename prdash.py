@@ -811,6 +811,7 @@ def run_tui(cfg: Config) -> int:
             Binding("3", "bucket('following')", "Following", show=False),
             Binding("4", "bucket('closed')", "Closed", show=False),
             Binding("q", "quit", "Quit"),
+            Binding("ctrl+q", "ignore_ctrl_q", show=False),
         ]
 
         def __init__(self) -> None:
@@ -823,6 +824,9 @@ def run_tui(cfg: Config) -> int:
             self.sync_msg = ""
             self.local: dict[str, dict] = {}
             self.last_sync = 0.0
+
+        def action_ignore_ctrl_q(self) -> None:
+            pass
 
         # ---- layout
         def compose(self) -> ComposeResult:

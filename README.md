@@ -96,7 +96,7 @@ Global option: `-c, --config PATH`.
 | `m` / `M` | Mark the PR seen / mark everything seen |
 | `e` | Activity log across all PRs |
 | `c` | Run `gh pr checkout` for the PR inside its local clone |
-| `q` | Quit |
+| `q` | Quit (`Ctrl+Q` is disabled) |
 
 The lower pane shows details for the highlighted PR: status, your role, CI, threads, size, requested reviewers, review states, local-clone info and its recent events.
 
