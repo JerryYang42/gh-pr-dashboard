@@ -26,22 +26,27 @@ detection, recently closed PR handling, and offline-first dashboard behavior.
 - [x] Reuse cached details when `updatedAt` and matched roles are unchanged.
   Hydrate when either changes; still fully refetch open PRs that stop matching
   searches so merges, closures and lost involvement are detected.
-- [ ] Compare query costs and sync duration against the Stage 1 baseline. Keep
+- [x] Compare query costs and sync duration against the Stage 1 baseline. Keep
   the optimization only if measured API work falls without behavioral
   regressions.
 
-Implementation is complete; the live before/after comparison remains pending.
+Live comparison: API cost fell from 392 to 18 points (about 95%); sync duration
+fell from 35.20 seconds to 29.33-31.33 seconds (about 14% on average).
 
 ### 3. Add bounded concurrency if measurements justify it
 
-- Fetch independent repositories concurrently with a small configurable or
-  fixed limit (initially around three in-flight repo fetches).
-- Keep SQLite writes serialized and preserve per-repo transaction boundaries.
-- Add backoff for rate-limit or secondary-rate-limit responses; do not retry
-  indefinitely or increase concurrency in response to failures.
-- Verify that concurrency improves wall-clock time without materially
+- [x] Fetch independent repositories concurrently with a fixed maximum of
+  three in-flight repo fetches.
+- [x] Keep SQLite reads and writes on the main sync thread and preserve
+  per-repo transaction boundaries.
+- [x] Retry rate-limit errors at most twice, with 60- and 120-second delays;
+  other errors are not retried.
+- [ ] Verify that concurrency improves wall-clock time without materially
   increasing rate-limit risk. Concurrency is a latency optimization, not a
   quota-reduction strategy.
+
+Implementation is complete; live concurrency and rate-limit behavior checks
+remain pending.
 
 ### 4. Reassess broader search only if needed
 

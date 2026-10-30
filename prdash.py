@@ -34,12 +34,15 @@ import sys
 import time
 import tomllib
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, TextIO
 
 GH = os.environ.get("PRDASH_GH", "gh")
+SYNC_WORKERS = 3
+RATE_LIMIT_RETRY_DELAYS = (60, 120)
 
 EXAMPLE_CONFIG = """\
 # prdash config: an explicit list of local clones. Nothing is scanned or guessed.
@@ -240,31 +243,45 @@ def gh_graphql(host: str, query: str, variables: dict | None = None, *,
     env = {**os.environ, "GH_PROMPT_DISABLED": "1", "NO_COLOR": "1"}
     started = time.monotonic()
     try:
-        try:
-            p = subprocess.run(
-                [GH, "api", "graphql", "--hostname", host, "--method", "POST", "--input", "-"],
-                input=body, capture_output=True, text=True, timeout=180, env=env,
-            )
-        except FileNotFoundError:
-            raise GhError("`gh` CLI not found on PATH (https://cli.github.com)") from None
-        except subprocess.TimeoutExpired:
-            raise GhError(f"timed out talking to {host}") from None
+        for attempt in range(len(RATE_LIMIT_RETRY_DELAYS) + 1):
+            try:
+                p = subprocess.run(
+                    [GH, "api", "graphql", "--hostname", host, "--method", "POST", "--input", "-"],
+                    input=body, capture_output=True, text=True, timeout=180, env=env,
+                )
+            except FileNotFoundError:
+                raise GhError("`gh` CLI not found on PATH (https://cli.github.com)") from None
+            except subprocess.TimeoutExpired:
+                raise GhError(f"timed out talking to {host}") from None
+            out = None
+            if p.stdout.strip():
+                try:
+                    out = json.loads(p.stdout)
+                except json.JSONDecodeError:
+                    pass
+            errors = [e.get("message", "") for e in (out or {}).get("errors") or []]
+            msg = "; ".join(errors) or (p.stderr or p.stdout).strip() or f"gh exited with {p.returncode}"
+            rate_limited = _is_rate_limit_error(msg)
+            if rate_limited and attempt < len(RATE_LIMIT_RETRY_DELAYS):
+                time.sleep(RATE_LIMIT_RETRY_DELAYS[attempt])
+                continue
+            if not out or out.get("data") is None or rate_limited:
+                raise GhError(msg[:400])
+            break
     finally:
         request_usage.duration_seconds = time.monotonic() - started
-    out = None
-    if p.stdout.strip():
-        try:
-            out = json.loads(p.stdout)
-        except json.JSONDecodeError:
-            pass
-    if not out or out.get("data") is None:
-        msg = (p.stderr or p.stdout).strip() or f"gh exited with {p.returncode}"
-        raise GhError(msg[:400])
     limit = out["data"].get("rateLimit") or {}
     request_usage.cost = limit.get("cost")
     request_usage.remaining = limit.get("remaining")
     request_usage.reset_at = limit.get("resetAt")
-    return out["data"], [e.get("message", "") for e in out.get("errors") or []]
+    return out["data"], errors
+
+
+def _is_rate_limit_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in (
+        "rate limit", "rate-limit", "abuse detection", "abuse limit",
+    ))
 
 
 def get_me(host: str, usage: list[GraphQLUsage] | None = None) -> str:
@@ -613,6 +630,57 @@ class SyncResult:
     duration_seconds: float = 0
 
 
+@dataclass
+class RepoFetchResult:
+    found: dict[str, dict] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    lost: list[str] = field(default_factory=list)
+    refetched: dict[str, dict] = field(default_factory=dict)
+    usage: list[GraphQLUsage] = field(default_factory=list)
+    error: str | None = None
+
+
+def _fetch_repo_state(spec: RepoSpec, me: str, since: str,
+                      existing: dict[str, dict]) -> RepoFetchResult:
+    result = RepoFetchResult()
+    try:
+        discovered, result.warnings = fetch_repo(spec, me, since, result.usage)
+        hydrate_ids = []
+        found = {}
+        for pid, candidate in discovered.items():
+            old_row = existing.get(pid)
+            if old_row is None:
+                hydrate_ids.append(pid)
+                continue
+            old_raw = json.loads(old_row["raw"])
+            if (candidate.get("updatedAt")
+                    and candidate.get("updatedAt") == old_raw.get("updatedAt")
+                    and candidate["_roles"] == old_raw.get("_roles", [])):
+                found[pid] = old_raw
+            else:
+                hydrate_ids.append(pid)
+        hydrated = fetch_nodes(
+            spec.host, hydrate_ids, context=f"{spec.key} PR hydration", usage=result.usage,
+        ) if hydrate_ids else {}
+        missing = [pid for pid in hydrate_ids if pid not in hydrated]
+        if missing:
+            raise GhError(f"{spec.key}: GraphQL returned no PR data for {len(missing)} discovered PR(s)")
+        for pid in hydrate_ids:
+            hydrated[pid]["_roles"] = discovered[pid]["_roles"]
+        found.update(hydrated)
+        result.found = found
+        result.lost = [
+            pid for pid, row in existing.items()
+            if pid not in found and not row["hidden"] and row["state"] == "OPEN"
+        ]
+        result.refetched = fetch_nodes(
+            spec.host, result.lost, context=f"{spec.key} lost PR refetch", usage=result.usage,
+        ) if result.lost else {}
+    except GhError as e:
+        result.error = str(e)
+    return result
+
+
 def _upsert(con: sqlite3.Connection, spec: RepoSpec, me: str, raw: dict, old_row: sqlite3.Row | None,
             now: float, first_sync: bool, hidden: bool = False) -> int:
     d_new = derive(raw, me)
@@ -646,68 +714,66 @@ def sync_all(cfg: Config, progress: Callable[[str], None] = lambda m: None) -> S
     since = (date.today() - timedelta(days=cfg.closed_days)).isoformat()
     mes: dict[str, str] = {}
     try:
-        for i, spec in enumerate(cfg.repos, 1):
-            progress(f"Syncing {spec.key} ({i}/{len(cfg.repos)})...")
+        host_errors: dict[str, str] = {}
+        for host in sorted({spec.host for spec in cfg.repos}):
             try:
-                if spec.host not in mes:
-                    mes[spec.host] = get_me(spec.host, res.graphql_usage)
-                me = mes[spec.host]
-                found, warns = fetch_repo(spec, me, since, res.graphql_usage)
-                res.warnings += warns
-
-                existing = {r["id"]: r for r in con.execute("SELECT * FROM pr WHERE repo_key=?", (spec.key,))}
-                hydrate_ids = []
-                raw_by_id = {}
-                for pid, discovered in found.items():
-                    old_row = existing.get(pid)
-                    if old_row is None:
-                        hydrate_ids.append(pid)
-                        continue
-                    old_raw = json.loads(old_row["raw"])
-                    if (discovered.get("updatedAt")
-                            and discovered.get("updatedAt") == old_raw.get("updatedAt")
-                            and discovered["_roles"] == old_raw.get("_roles", [])):
-                        raw_by_id[pid] = old_raw
-                    else:
-                        hydrate_ids.append(pid)
-                hydrated = fetch_nodes(
-                    spec.host, hydrate_ids, context=f"{spec.key} PR hydration", usage=res.graphql_usage,
-                ) if hydrate_ids else {}
-                missing = [pid for pid in hydrate_ids if pid not in hydrated]
-                if missing:
-                    raise GhError(f"{spec.key}: GraphQL returned no PR data for {len(missing)} discovered PR(s)")
-                for pid in hydrate_ids:
-                    hydrated[pid]["_roles"] = found[pid]["_roles"]
-                raw_by_id.update(hydrated)
-                found = raw_by_id
-                lost = [i_ for i_, r in existing.items() if i_ not in found and not r["hidden"] and r["state"] == "OPEN"]
-                refetched = fetch_nodes(
-                    spec.host, lost, context=f"{spec.key} lost PR refetch", usage=res.graphql_usage,
-                ) if lost else {}
+                mes[host] = get_me(host, res.graphql_usage)
             except GhError as e:
-                res.failures.append((spec.key, str(e)))
-                continue
+                host_errors[host] = str(e)
 
-            now = time.time()
-            first = meta_get(con, f"repo_synced:{spec.key}") is None
-            with con:
-                meta_set(con, f"me:{spec.host}", me)
-                for pid, raw in found.items():
-                    res.events += _upsert(con, spec, me, raw, existing.get(pid), now, first)
-                for pid in lost:
-                    raw = refetched.get(pid)
-                    if raw is None:  # deleted, transferred or no longer visible
-                        con.execute("UPDATE pr SET hidden=1, synced=? WHERE id=?", (now, pid))
-                        continue
-                    raw["_roles"] = json.loads(existing[pid]["raw"]).get("_roles", [])
-                    if raw.get("state") == "OPEN":
-                        # still open but your involvement is gone: stop showing it
-                        raw["_roles"] = []
-                        res.events += _upsert(con, spec, me, raw, existing[pid], now, False, hidden=True)
-                    else:
-                        res.events += _upsert(con, spec, me, raw, existing[pid], now, False)
-                meta_set(con, f"repo_synced:{spec.key}", str(now))
-            res.repos_ok += 1
+        existing_by_repo = {
+            spec.key: {
+                row["id"]: dict(row)
+                for row in con.execute("SELECT * FROM pr WHERE repo_key=?", (spec.key,))
+            }
+            for spec in cfg.repos
+        }
+        jobs = [
+            (spec, mes[spec.host], existing_by_repo[spec.key])
+            for spec in cfg.repos
+            if spec.host in mes
+        ]
+        for spec in cfg.repos:
+            if spec.host in host_errors:
+                res.failures.append((spec.key, host_errors[spec.host]))
+
+        with ThreadPoolExecutor(max_workers=min(SYNC_WORKERS, max(1, len(jobs)))) as pool:
+            futures = {
+                pool.submit(_fetch_repo_state, spec, me, since, existing): (spec, me, existing)
+                for spec, me, existing in jobs
+            }
+            completed = 0
+            for future in as_completed(futures):
+                spec, me, existing = futures[future]
+                result = future.result()
+                res.graphql_usage.extend(result.usage)
+                res.warnings.extend(result.warnings)
+                completed += 1
+                progress(f"Syncing {spec.key} ({completed}/{len(jobs)})...")
+                if result.error:
+                    res.failures.append((spec.key, result.error))
+                    continue
+
+                now = time.time()
+                first = meta_get(con, f"repo_synced:{spec.key}") is None
+                with con:
+                    meta_set(con, f"me:{spec.host}", me)
+                    for pid, raw in result.found.items():
+                        res.events += _upsert(con, spec, me, raw, existing.get(pid), now, first)
+                    for pid in result.lost:
+                        raw = result.refetched.get(pid)
+                        if raw is None:  # deleted, transferred or no longer visible
+                            con.execute("UPDATE pr SET hidden=1, synced=? WHERE id=?", (now, pid))
+                            continue
+                        raw["_roles"] = json.loads(existing[pid]["raw"]).get("_roles", [])
+                        if raw.get("state") == "OPEN":
+                            # still open but your involvement is gone: stop showing it
+                            raw["_roles"] = []
+                            res.events += _upsert(con, spec, me, raw, existing[pid], now, False, hidden=True)
+                        else:
+                            res.events += _upsert(con, spec, me, raw, existing[pid], now, False)
+                    meta_set(con, f"repo_synced:{spec.key}", str(now))
+                res.repos_ok += 1
 
         with con:
             meta_set(con, "last_sync", str(time.time()))
