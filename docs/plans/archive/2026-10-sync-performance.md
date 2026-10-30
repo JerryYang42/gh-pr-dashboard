@@ -41,7 +41,7 @@ fell from 35.20 seconds to 29.33-31.33 seconds (about 14% on average).
   per-repo transaction boundaries.
 - [x] Retry rate-limit errors at most twice, with 60- and 120-second delays;
   other errors are not retried.
-- [ ] Verify that concurrency improves wall-clock time without materially
+- [x] Verify that concurrency improves wall-clock time without materially
   increasing rate-limit risk. Concurrency is a latency optimization, not a
   quota-reduction strategy.
 
