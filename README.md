@@ -142,7 +142,16 @@ Other environment variables: `PRDASH_GH` points to a different `gh` binary.
 
 ## How syncing works
 
-For each repo, one GraphQL request (through `gh api graphql --hostname <host>`) runs a set of searches scoped to that repo only: PRs you authored, are assigned to, have a review requested on, have reviewed, or are otherwise involved in, open plus recently closed. Results are merged by PR, stored, and diffed. Open PRs that stopped matching any search are re-fetched by id so that merges and closures are still recorded; if one is still open but no longer involves you, it is hidden.
+For each repo, a lightweight GraphQL discovery request (through `gh api graphql --hostname <host>`) runs searches scoped to that repo: PRs you authored, are assigned to, have a review requested on, have reviewed, or are otherwise involved in, open plus recently closed. Results are merged by PR ID. Full PR details are fetched in batches only for new PRs or PRs whose `updatedAt` or matched roles changed; cached details are reused for unchanged PRs. This preserves current role membership while avoiding repeated detail reads. Open PRs that stopped matching any search are re-fetched by id so that merges and closures are still recorded; if one is still open but no longer involves you, it is hidden.
+
+Independent repo fetches run with a maximum of 256 (configrable as `SYNC_WORKERS`) in flight. GraphQL rate-limit errors are retried at most twice, with 60- and 120-second delays. SQLite reads and writes remain on the main sync thread.
+
+`prdash sync` reports GraphQL request count, cost, remaining quota, reset time
+and duration per request, grouped by host. The values come from GitHub's
+`rateLimit` GraphQL field; when a host does not return rate-limit data, the
+report shows `n/a`. Capture a baseline by running `prdash sync` with a
+representative repo list and noting the per-host totals, request details and
+sync duration. Quota limits can differ between GitHub.com and GitHub Enterprise.
 
 The tool is read-only toward GitHub and your repos. It never pushes, comments, fetches or modifies a clone. The only write action is `c`, which runs `gh pr checkout` when you press it.
 
@@ -153,7 +162,7 @@ The tool is read-only toward GitHub and your repos. It never pushes, comments, f
 - **"not a git repository":** the `path` is wrong or not a clone. Repos listed with both `host` and `slug` skip this check.
 - **A PR you expect is missing:** its repo may not be in your list, or it was closed more than `closed_days` ago.
 - **Warning about more than 50 results:** each search returns at most 50 PRs per role per repo.
-- **Sync is slow or hits GraphQL limits:** raise `auto_sync_minutes`, or split a very large repo list across runs.
+- **Sync is slow or hits GraphQL limits:** run `prdash sync` to inspect per-host request costs and remaining quota. Raise `auto_sync_minutes` to reduce request frequency; splitting repos across runs can spread load but does not reduce total API points. Repo fetch concurrency is capped at three to limit request bursts.
 
 ## Limitations
 
