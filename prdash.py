@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Callable, TextIO
 
 GH = os.environ.get("PRDASH_GH", "gh")
-SYNC_WORKERS = 3
+SYNC_WORKERS = 256
 RATE_LIMIT_RETRY_DELAYS = (60, 120)
 
 EXAMPLE_CONFIG = """\
